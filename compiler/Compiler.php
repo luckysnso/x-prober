@@ -1,16 +1,32 @@
 <?php
 
-namespace InnStudio\Compiler;
+namespace InnStudio\Prober\Compiler;
 
 class Compiler
 {
-    private $baseDir         = '';
-    private $compileFilePath = '';
+    private $ROOT              = '';
+    private $BASE_DIR          = '';
+    private $COMPILE_FILE_PATH = '';
+    private $COMPONENTS_DIR    = '';
 
     public function __construct(string $dir)
     {
-        $this->baseDir         = "{$dir}/src";
-        $this->compileFilePath = "{$dir}/dist/prober.php";
+        $this->ROOT              = $dir;
+        $this->BASE_DIR          = "{$dir}/src";
+        $this->COMPONENTS_DIR    = "{$this->BASE_DIR}/Components";
+        $this->COMPILE_FILE_PATH = "{$dir}/dist/prober.php";
+
+        // generate config
+        new ConfigGeneration([
+            'phpConfigPath' => "{$this->COMPONENTS_DIR}/Config/ConfigApi.php",
+            'configPath'    => "{$this->ROOT}/AppConfig.json",
+        ]);
+
+        // generate benchmark
+        new ServerBenchmarkGeneration([
+            'phpConfigPath' => "{$this->COMPONENTS_DIR}/ServerBenchmark/ServerBenchmarkMarks.php",
+            'configPath'    => "{$this->ROOT}/AppConfig.json",
+        ]);
 
         // lang
         $this->languageGeneration($dir);
@@ -19,25 +35,45 @@ class Compiler
 
         $code = '';
 
-        foreach ($this->yieldFiles($this->baseDir) as $filePath) {
-            if (\is_dir($filePath) || false === \strpos($filePath, '.php')) {
-                continue;
-            }
+        if ( ! $this->isDev()) {
+            foreach ($this->yieldFiles($this->COMPONENTS_DIR) as $filePath) {
+                if (\is_dir($filePath) || false === \strpos($filePath, '.php')) {
+                    continue;
+                }
 
-            $content = $this->getCodeViaFilePath($filePath);
-            $code .= $content;
+                $content = $this->getCodeViaFilePath($filePath);
+                $code .= $content;
+            }
         }
 
         $preDefineCode = $this->preDefine([
             $this->getTimerCode(),
-            $this->getDebugCode(),
+            $this->getDevMode(),
             $this->getLangLoaderCode(),
+            $this->getVendorCode(),
         ]);
         $code = "<?php\n{$preDefineCode}\n{$code}";
         $code .= $this->loader();
         $code = \preg_replace("/(\r|\n)+/", "\n", $code);
 
         if (true === $this->writeFile($code)) {
+            new ScriptGeneration([
+                'scriptFilePath' => "{$this->ROOT}/tmp/app.js",
+                'distFilePath'   => $this->COMPILE_FILE_PATH,
+            ]);
+            new StyleGeneration([
+                'styleFilePath' => "{$this->ROOT}/tmp/app.css",
+                'distFilePath'  => $this->COMPILE_FILE_PATH,
+            ]);
+
+            if ( ! $this->isDev()) {
+                if ($this->isDebug()) {
+                    $this->writeFile(\file_get_contents($this->COMPILE_FILE_PATH));
+                } else {
+                    $this->writeFile(\php_strip_whitespace($this->COMPILE_FILE_PATH));
+                }
+            }
+
             echo 'Compiled!';
         } else {
             echo 'Failed.';
@@ -49,7 +85,7 @@ class Compiler
         echo "Generating I18n language pack...\n";
 
         $langGen = new LanguageGeneration("{$dir}/languages");
-        $status  = $langGen->writeJsonFile("{$dir}/src/I18n/Lang.json");
+        $status  = $langGen->writeJsonFile("{$this->COMPONENTS_DIR}/I18n/Lang.json");
 
         if ( ! $status) {
             die("Error: can not generate languages.\n");
@@ -64,22 +100,26 @@ class Compiler
 
         echo "Packing `{$filePath}...";
 
-        if (true === $this->isDev()) {
+        if ($this->isDev()) {
             $code = \file_get_contents($filePath);
         } else {
-            $code     = \php_strip_whitespace($filePath);
-            $lines    = \explode("\n", $code);
-            $lineCode = [];
+            if ($this->isDebug()) {
+                $code = \file_get_contents($filePath);
+            } else {
+                $code     =  \php_strip_whitespace($filePath);
+                $lines    = \explode("\n", $code);
+                $lineCode = [];
 
-            foreach ($lines as $line) {
-                $lineStr = \trim($line);
+                foreach ($lines as $line) {
+                    $lineStr = \trim($line);
 
-                if ($lineStr) {
-                    $lineCode[] = $lineStr;
+                    if ($lineStr) {
+                        $lineCode[] = $lineStr;
+                    }
                 }
-            }
 
-            $code = \implode("\n", $lineCode);
+                $code = \implode("\n", $lineCode);
+            }
         }
 
         $code = \trim($code, "\n");
@@ -96,35 +136,46 @@ class Compiler
         return \in_array('dev', $argv);
     }
 
+    private function isDebug(): bool
+    {
+        global $argv;
+
+        return \in_array('debug', $argv);
+    }
+
     private function preDefine(array $code): string
     {
         $codeStr = \implode("\n", $code);
 
-        return <<<EOT
-namespace InnStudio\Prober\PreDefine;
+        return <<<PHP
+namespace InnStudio\\Prober\\Components\\PreDefine;
 {$codeStr}
-EOT;
+PHP;
+    }
+
+    private function getDevMode(): string
+    {
+        $isDev = $this->isDev() ? 'true' : 'false';
+
+        return <<<PHP
+\\define('XPROBER_IS_DEV', {$isDev});
+PHP;
     }
 
     private function getTimerCode(): string
     {
-        return <<<EOT
-\define('TIMER', \microtime(true));
-EOT;
-    }
-
-    private function getDebugCode(): string
-    {
-        $debug = $this->isDev() ? 'true' : 'false';
-
-        return <<<EOT
-\define('DEBUG', {$debug});
-EOT;
+        return <<<'PHP'
+\define('XPROBER_TIMER', \microtime(true));
+PHP;
     }
 
     private function getLangLoaderCode(): string
     {
-        $filePath = $this->baseDir . '/I18n/Lang.json';
+        if ($this->isDev()) {
+            return '';
+        }
+
+        $filePath = $this->COMPONENTS_DIR . '/I18n/Lang.json';
 
         if ( ! \is_readable($filePath)) {
             die('Language is missing.');
@@ -143,17 +194,16 @@ EOT;
             die('Invalid json format.');
         }
 
-        $json = \base64_encode(\json_encode($json));
-        $json = <<<EOT
-\define('LANG', '{$json}');
-EOT;
+        $json = \serialize($json);
 
-        return $json;
+        return <<<PHP
+\\define('XPROBER_LANGUAGES', '{$json}');
+PHP;
     }
 
     private function loader(): string
     {
-        $dirs = \glob($this->baseDir . '/*');
+        $dirs = \glob($this->COMPONENTS_DIR . '/*');
 
         if ( ! $dirs) {
             return '';
@@ -169,16 +219,27 @@ EOT;
                 continue;
             }
 
-            if ('Entry' === $basename) {
+            if ('Bootstrap' === $basename) {
                 continue;
             }
 
-            $files[] = "new \\InnStudio\\Prober\\{$basename}\\{$basename}();";
+            $files[] = "new \\InnStudio\\Prober\\Components\\{$basename}\\{$basename}();";
         }
 
-        $files[] = 'new \\InnStudio\\Prober\\Entry\\Entry();';
+        $files[] = 'new \\InnStudio\\Prober\\Components\\Bootstrap\\Bootstrap();';
 
         return \implode("\n", $files);
+    }
+
+    private function getVendorCode(): string
+    {
+        if ( ! $this->isDev()) {
+            return '';
+        }
+
+        return <<<PHP
+include \dirname(__DIR__) . '/vendor/autoload.php';
+PHP;
     }
 
     private function yieldFiles(string $dir): \Iterator
@@ -214,12 +275,12 @@ EOT;
 
     private function writeFile(string $data): bool
     {
-        $dir = \dirname($this->compileFilePath);
+        $dir = \dirname($this->COMPILE_FILE_PATH);
 
         if ( ! \is_dir($dir)) {
             \mkdir($dir, 0755, true);
         }
 
-        return (bool) \file_put_contents($this->compileFilePath, $data);
+        return (bool) \file_put_contents($this->COMPILE_FILE_PATH, $data);
     }
 }
